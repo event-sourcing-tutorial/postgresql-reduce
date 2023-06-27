@@ -1,13 +1,25 @@
 pub use actions::{create, delete, fetch, update, Action, ObjectTypeName, NOOP};
 use async_recursion::async_recursion;
+use change::Change;
+use eventsapis_proto::{
+    events_apis_client::EventsApisClient, PollEventsRequest, PollEventsResponse,
+};
+use pgpool::PgPool;
 use serde::de::DeserializeOwned;
 use serde_json::{from_value, Value};
 use std::{
     collections::{hash_map::Entry, HashMap},
     fmt::Display,
     future::Future,
+    sync::Arc,
 };
+use tokio::sync::broadcast;
 use tokio_postgres::NoTls;
+use tonic::Request;
+
+mod change;
+mod grpc_server;
+mod pgpool;
 
 const SLEEP_SECS: u64 = 2;
 
@@ -46,27 +58,27 @@ async fn init_postgres() -> Result<i64, tokio_postgres::Error> {
     Ok(result)
 }
 
+async fn pause_for_error<E: Display>(err: E) {
+    use tokio::time::{sleep, Duration};
+    eprintln!("Error {}", err);
+    eprintln!("Retrying in {} secs", SLEEP_SECS);
+    sleep(Duration::from_secs(SLEEP_SECS)).await;
+}
+
 async fn forever<T, E, R, F>(f: F) -> T
 where
     E: Display,
     R: Future<Output = Result<T, E>>,
     F: Fn() -> R,
 {
-    use tokio::time::{sleep, Duration};
     loop {
         match f().await {
             Err(err) => {
-                eprintln!("Error {}", err);
-                eprintln!("Retrying in {} secs", SLEEP_SECS);
-                sleep(Duration::from_secs(SLEEP_SECS)).await;
+                pause_for_error(err).await;
             }
             Ok(value) => break value,
         }
     }
-}
-
-async fn poll_next_events(_idx: i64) -> Vec<Value> {
-    todo!();
 }
 
 struct ValueBox {
@@ -177,12 +189,16 @@ where
         }
     }
 
-    fn get_changes(self) -> Vec<(String, String, Option<Value>)> {
+    fn get_changes(self) -> Vec<Change> {
         let mut v = Vec::new();
         for (object_type, h) in self.hmp.into_iter() {
             for (object_id, vbox) in h.into_iter() {
                 if vbox.modified {
-                    v.push((object_type.to_owned(), object_id, vbox.current_value));
+                    v.push(Change {
+                        object_type: object_type.to_owned(),
+                        object_id: object_id,
+                        object_data: vbox.current_value,
+                    });
                 }
             }
         }
@@ -194,18 +210,13 @@ async fn process_events<F, E>(
     idx: i64,
     events: &Vec<Value>,
     f: &F,
-) -> Result<(), tokio_postgres::Error>
+    pool: &Arc<PgPool>,
+) -> Result<Vec<Change>, tokio_postgres::Error>
 where
     E: DeserializeOwned,
     F: Fn(E) -> Action,
 {
-    let (client, connection) =
-        tokio_postgres::connect("host=localhost user=postgres dbname=postgres", NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {}", e);
-        }
-    });
+    let client = pool.get_client().await?;
     client
         .execute("begin transaction isolation level serializable", &[])
         .await?;
@@ -236,7 +247,12 @@ where
     client
         .execute("insert into event (idx) values ($1)", &[&idx])
         .await?;
-    for (object_type, object_id, object_data) in changes {
+    for change in changes.iter() {
+        let Change {
+            object_type,
+            object_id,
+            object_data,
+        } = change;
         client
             .execute(
                 "insert into object (type, id, idx, value) values ($1, $2, $3, $4)",
@@ -245,7 +261,75 @@ where
             .await?;
     }
     client.execute("commit", &[]).await?;
-    Ok(())
+    pool.put_client(client).await;
+    Ok(changes)
+}
+
+// fn print_message(idx: i64, inserted: prost_types::Timestamp, events: Vec<Value>) {
+//     use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+//     let inserted = OffsetDateTime::from_unix_timestamp(inserted.seconds).unwrap()
+//         + Duration::nanoseconds(inserted.nanos as i64);
+//     let inserted = inserted.format(&Rfc3339).unwrap();
+//     println!(
+//         "{} {} {}",
+//         idx,
+//         inserted,
+//         serde_json::to_string(&events).unwrap(),
+//     );
+// }
+
+fn parse_events(payload: prost_types::Value) -> Vec<Value> {
+    use anystruct::IntoJSON;
+    let payload = payload.into_json();
+    println!("parsing {}", serde_json::to_string(&payload).unwrap());
+    let eventslist = match payload {
+        Value::Object(mut map) => map.remove("events"),
+        others => panic!("invalid payload: expected an object, found {:?}", others),
+    };
+    match eventslist {
+        Some(Value::Array(events)) => events,
+        others => panic!(
+            "invalid payload.events: expected an array, found {:?}",
+            others
+        ),
+    }
+}
+
+async fn start_polling<T: DeserializeOwned, F: Fn(T) -> Action>(
+    last_idx: i64,
+    f: F,
+    tx: &broadcast::Sender<Arc<(i64, Vec<Change>)>>,
+    pool: &Arc<PgPool>,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    let mut client = EventsApisClient::connect("http://eventsapis:40001").await?;
+    let mut stream = client
+        .poll_events(Request::new(PollEventsRequest { last_idx }))
+        .await?
+        .into_inner();
+    let mut last_idx = last_idx;
+    loop {
+        match stream.message().await {
+            Ok(Some(message)) => {
+                let PollEventsResponse {
+                    idx,
+                    inserted: _inserted,
+                    payload,
+                } = message;
+                assert_eq!(idx, last_idx + 1);
+                let events = parse_events(payload.unwrap());
+                //print_message(idx, inserted.unwrap(), events);
+                let changes = forever(|| process_events(idx, &events, &f, &pool)).await;
+                tx.send(Arc::new((idx, changes))).unwrap();
+                last_idx = idx;
+            }
+            Ok(None) => break,
+            Err(err) => {
+                eprintln!("an error occurred while polling a message: {}", err);
+                break ();
+            }
+        }
+    }
+    Ok(last_idx)
 }
 
 pub fn start_reducing<T: DeserializeOwned, F: Fn(T) -> Action>(f: F) {
@@ -254,12 +338,27 @@ pub fn start_reducing<T: DeserializeOwned, F: Fn(T) -> Action>(f: F) {
         .build()
         .unwrap()
         .block_on(async {
-            let mut idx = forever(init_postgres).await;
-            println!("Done! idx={}", idx);
+            let config = tokio_postgres::Config::new()
+                .host("localhost")
+                .user("postgres")
+                .dbname("postgres")
+                .clone();
+            let pool = Arc::new(pgpool::PgPool::new(config));
+            let mut last_idx = forever(init_postgres).await;
+            println!("starting with last_idx={}", last_idx);
+            let (tx, rx) = broadcast::channel(32);
+            tokio::spawn({
+                let pool = pool.clone();
+                let last_idx = last_idx;
+                async move { grpc_server::start(last_idx, rx, pool).await.unwrap() }
+            });
             loop {
-                let events = poll_next_events(idx).await;
-                forever(|| process_events(idx + 1, &events, &f)).await;
-                idx += 1;
+                match start_polling(last_idx, &f, &tx, &pool).await {
+                    Ok(idx) => last_idx = idx,
+                    Err(err) => {
+                        pause_for_error(err).await;
+                    }
+                }
             }
         })
 }
