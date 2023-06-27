@@ -38,11 +38,36 @@ impl PgPool {
 
     pub async fn get_object(
         &self,
-        _object_type: String,
-        _object_id: String,
-        _idx: Option<i64>,
+        object_type: String,
+        object_id: String,
+        object_idx: Option<i64>,
     ) -> Result<Option<(i64, Option<Value>)>, Error> {
-        todo!();
+        let client = self.get_client().await?;
+        let row = if let Some(idx) = object_idx {
+            client
+                .query_opt(
+                    "select idx, value from object
+                         where type = $1
+                         and id = $2
+                         and idx = (select max(idx) from object
+                                        where type = $1 and id = $2 and idx <= $3)",
+                    &[&object_type, &object_id, &idx],
+                )
+                .await?
+        } else {
+            client
+                .query_opt(
+                    "select idx, value from object
+                         where type = $1
+                         and id = $2
+                         and idx = (select max(idx) from object
+                                        where type = $1 and id = $2)",
+                    &[&object_type, &object_id],
+                )
+                .await?
+        };
+        self.put_client(client).await;
+        Ok(row.map(|row| (row.get("idx"), row.get("value"))))
     }
 
     // async fn try_get_payload(&self, idx: i64) -> Result<Value, Error> {

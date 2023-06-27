@@ -1,4 +1,5 @@
 use crate::{change::Change, pgpool::PgPool};
+use anystruct::IntoProto;
 use futures::lock::Mutex;
 use reducerapis_proto::{
     reducer_apis_server::{ReducerApis, ReducerApisServer},
@@ -56,20 +57,19 @@ impl ReducerApis for GrpcServer {
                 }
             }
         }
-        use anystruct::IntoProto;
         let result = self
             .pool
             .get_object(object_type, object_id, idx)
             .await
             .unwrap();
-        let (idx, value) = match result {
+        let (object_idx, object_data) = match result {
             None => (None, None),
             Some((idx, None)) => (Some(idx), None),
             Some((idx, Some(value))) => (Some(idx), Some(value.into_proto())),
         };
         let response = GetObjectResponse {
-            idx,
-            object_data: value,
+            idx: object_idx,
+            object_data,
         };
         Ok(Response::new(response))
     }
@@ -80,7 +80,7 @@ pub async fn start(
     msgrx: broadcast::Receiver<Arc<(i64, Vec<Change>)>>,
     pool: Arc<PgPool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "0.0.0.0:40001".parse()?;
+    let addr = "0.0.0.0:40002".parse()?;
     let (tx, rx) = broadcast::channel(32);
     let server = GrpcServer::new(last_idx, pool, rx);
     tokio::spawn({
